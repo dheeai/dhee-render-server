@@ -1,12 +1,11 @@
 {
   "name": "dhee-render-server",
-  "version": "0.1.0",
-  "description": "HTTP render service for web_motion compositions — headless-Chromium frame rendering, parallelized across worker browsers. Deploy on a many-core GPU box; dhee-core offloads the heavy frame render to it.",
+  "version": "0.2.0",
+  "description": "A GENERIC headless-Chromium HTML->video appliance. POST self-contained HTML (assets inlined as data: URIs) implementing the seekable-animation protocol (window.seek(t) + window.__dur); it steps the clock frame-by-frame, screenshots, ffmpegs, and returns the mp4. Knows NOTHING about any DSL, app, or filesystem layout — deploy on a many-core/GPU box and never redeploy when the client's DSL changes.",
   "type": "module",
   "bin": { "dhee-render-server": "server.js" },
   "scripts": { "start": "node server.js" },
   "dependencies": {
-    "dhee-runner-web-motion": "github:dheeai/dhee-runner-web-motion",
     "puppeteer-core": "^23.0.0"
   },
   "license": "MIT"
