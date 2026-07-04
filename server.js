@@ -131,14 +131,23 @@ const JOB_TTL_MS = 60 * 60 * 1000; // keep a finished job's mp4 for an hour
 const jobs = new Map(); // id -> { status, dir, outPath, frames, seconds, renderMs, error, tCreated, tEnd }
 const queue = [];
 let running = false;
+let current = null; // the job currently rendering (for the /busy signal), else null
+
+// BUSY SIGNAL for the gateway. Async means the HTTP connection no longer stays open for the
+// render's duration, so the gateway can't infer "render busy" from an in-flight request anymore.
+// It must POLL this instead and treat the render as an active, resource-heavy backend while busy
+// (currently CPU/RAM-heavy: WORKERS headless browsers; software-GL, but still saturates the box).
+// Serialize GPU-model residency / heavy work against this the same way other backends are.
+const busyState = () => ({ busy: running || queue.length > 0, running, queued: queue.length,
+  jobId: current ? current.id : null, elapsedMs: current ? Date.now() - current.t0 : 0 });
 
 async function pump() {
   if (running) return;
   const job = queue.shift();
   if (!job) return;
-  running = true;
+  running = true; current = job;
   job.status = 'running';
-  const t0 = Date.now();
+  const t0 = Date.now(); job.t0 = t0;
   try {
     const html = readFileSync(join(job.dir, 'page.html'), 'utf8');
     const audioPath = existsSync(join(job.dir, 'audio.wav')) ? join(job.dir, 'audio.wav') : null;
@@ -150,7 +159,7 @@ async function pump() {
     process.stderr.write(`[${job.id.slice(0, 8)}] ERROR: ${job.error}\n`);
   } finally {
     try { unlinkSync(join(job.dir, 'page.html')); } catch { /* free the big html asap */ }
-    running = false; setImmediate(pump);
+    running = false; current = null; setImmediate(pump);
   }
 }
 
@@ -166,8 +175,13 @@ const server = http.createServer((req, res) => {
   const url = (req.url || '').split('?')[0];
   if (req.method === 'GET' && (url === '/healthz' || url === '/')) {
     let chrome = null; try { chrome = resolveChrome(); } catch { /* report null */ }
-    return send(res, 200, { ok: true, workers: WORKERS, chrome, running, queued: queue.length, service: 'dhee-render-server (generic html->video, async)' });
+    return send(res, 200, { ok: true, workers: WORKERS, chrome, service: 'dhee-render-server (generic html->video, async)', ...busyState() });
   }
+
+  // BUSY SIGNAL — the gateway polls this to know if a render is in-flight (async broke the
+  // "open connection == busy" inference). Cheap, no job lookup; treat busy=true as an active
+  // resource-heavy backend when making residency/scheduling decisions.
+  if (req.method === 'GET' && url === '/busy') return send(res, 200, busyState());
 
   // GET /status/:id
   let m = url.match(/^\/status\/([\w-]+)$/);
