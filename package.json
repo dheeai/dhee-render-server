@@ -1,0 +1,13 @@
+{
+  "name": "dhee-render-server",
+  "version": "0.1.0",
+  "description": "HTTP render service for web_motion compositions — headless-Chromium frame rendering, parallelized across worker browsers. Deploy on a many-core GPU box; dhee-core offloads the heavy frame render to it.",
+  "type": "module",
+  "bin": { "dhee-render-server": "server.js" },
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "dhee-runner-web-motion": "github:dheeai/dhee-runner-web-motion",
+    "puppeteer-core": "^23.0.0"
+  },
+  "license": "MIT"
+}
