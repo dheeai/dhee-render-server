@@ -17,9 +17,10 @@
 // Determinism (seek(t) is a pure function of t) is what makes the parallel worker split safe.
 import http from 'node:http';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync, readFileSync, statSync, createReadStream } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import puppeteer from 'puppeteer-core';
 
 const PORT = Number(process.env.PORT) || 8787;
@@ -119,35 +120,94 @@ async function renderHtmlToMp4({ html, size, fps, dur, scale, audioPath, outPath
 
 const send = (res, code, obj) => { const b = JSON.stringify(obj); res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(b) }); res.end(b); };
 
-const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/')) {
-    let chrome = null; try { chrome = resolveChrome(); } catch { /* report null */ }
-    return send(res, 200, { ok: true, workers: WORKERS, chrome, service: 'dhee-render-server (generic html->video)' });
-  }
-  if (req.method !== 'POST' || req.url !== '/render') return send(res, 404, { error: 'not found' });
+// ASYNC JOBS: a render can run for many minutes, so we NEVER hold the HTTP connection open for
+// its duration (that couples render time to fetch/proxy timeouts — the 300s failure). Instead:
+//   POST /render      -> { jobId } immediately (202); render runs in the background
+//   GET  /status/:id  -> { status: queued|running|done|error, frames?, seconds?, renderMs?, error? }
+//   GET  /result/:id  -> the mp4 streamed as binary (video/mp4) once status=done
+// Jobs run one-at-a-time (a single render already saturates all worker browsers). Finished jobs
+// are swept after a TTL. State is in-memory — fine for a single-box appliance.
+const JOB_TTL_MS = 60 * 60 * 1000; // keep a finished job's mp4 for an hour
+const jobs = new Map(); // id -> { status, dir, outPath, frames, seconds, renderMs, error, tCreated, tEnd }
+const queue = [];
+let running = false;
 
-  let body = '';
-  req.on('data', (c) => { body += c; if (body.length > MAX_BODY) { req.destroy(); } });
-  req.on('end', async () => {
-    let job; try { job = JSON.parse(body); } catch { return send(res, 400, { error: 'invalid JSON body' }); }
-    if (!job || !job.html) return send(res, 400, { error: 'missing html (POST a self-contained page implementing window.seek/window.__dur)' });
-    const dir = mkdtempSync(join(tmpdir(), 'dhee-render-'));
-    const out = join(dir, 'out.mp4');
-    try {
-      let audioPath = null;
-      if (job.audioB64) { audioPath = join(dir, 'audio.wav'); writeFileSync(audioPath, Buffer.from(job.audioB64, 'base64')); }
-      const t0 = Date.now();
-      const r = await renderHtmlToMp4({
-        html: job.html, size: job.size || [1280, 720], fps: Number(job.fps) || 30,
-        dur: Number(job.dur) || 0, scale: Number(job.scale) || 2, audioPath, outPath: out,
-        log: (m) => process.stderr.write(m + '\n'),
-      });
-      const mp4B64 = readFileSync(out).toString('base64');
-      send(res, 200, { ok: true, mp4B64, frames: r.frames, seconds: r.seconds, renderMs: Date.now() - t0 });
-    } catch (e) {
-      send(res, 500, { error: String((e && e.message) || e) });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
+async function pump() {
+  if (running) return;
+  const job = queue.shift();
+  if (!job) return;
+  running = true;
+  job.status = 'running';
+  const t0 = Date.now();
+  try {
+    const html = readFileSync(join(job.dir, 'page.html'), 'utf8');
+    const audioPath = existsSync(join(job.dir, 'audio.wav')) ? join(job.dir, 'audio.wav') : null;
+    const r = await renderHtmlToMp4({ html, size: job.size, fps: job.fps, dur: job.dur, scale: job.scale, audioPath, outPath: job.outPath, log: (m) => process.stderr.write(`[${job.id.slice(0, 8)}] ${m}\n`) });
+    job.frames = r.frames; job.seconds = r.seconds; job.renderMs = Date.now() - t0; job.status = 'done'; job.tEnd = Date.now();
+    process.stderr.write(`[${job.id.slice(0, 8)}] done: ${r.frames} frames in ${(job.renderMs / 1000).toFixed(1)}s\n`);
+  } catch (e) {
+    job.status = 'error'; job.error = String((e && e.message) || e); job.tEnd = Date.now();
+    process.stderr.write(`[${job.id.slice(0, 8)}] ERROR: ${job.error}\n`);
+  } finally {
+    try { unlinkSync(join(job.dir, 'page.html')); } catch { /* free the big html asap */ }
+    running = false; setImmediate(pump);
+  }
+}
+
+function sweep() {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.tEnd && now - job.tEnd > JOB_TTL_MS) { try { rmSync(job.dir, { recursive: true, force: true }); } catch { /* ignore */ } jobs.delete(id); }
+  }
+}
+setInterval(sweep, 5 * 60 * 1000).unref();
+
+const server = http.createServer((req, res) => {
+  const url = (req.url || '').split('?')[0];
+  if (req.method === 'GET' && (url === '/healthz' || url === '/')) {
+    let chrome = null; try { chrome = resolveChrome(); } catch { /* report null */ }
+    return send(res, 200, { ok: true, workers: WORKERS, chrome, running, queued: queue.length, service: 'dhee-render-server (generic html->video, async)' });
+  }
+
+  // GET /status/:id
+  let m = url.match(/^\/status\/([\w-]+)$/);
+  if (req.method === 'GET' && m) {
+    const job = jobs.get(m[1]);
+    if (!job) return send(res, 404, { error: 'unknown jobId' });
+    return send(res, 200, { status: job.status, frames: job.frames, seconds: job.seconds, renderMs: job.renderMs, error: job.error });
+  }
+
+  // GET /result/:id  -> stream the mp4 binary
+  m = url.match(/^\/result\/([\w-]+)$/);
+  if (req.method === 'GET' && m) {
+    const job = jobs.get(m[1]);
+    if (!job) return send(res, 404, { error: 'unknown jobId' });
+    if (job.status !== 'done') return send(res, 409, { error: `job not done (status=${job.status})`, status: job.status });
+    if (!existsSync(job.outPath)) return send(res, 410, { error: 'result expired/swept' });
+    const stat = statSync(job.outPath);
+    res.writeHead(200, { 'content-type': 'video/mp4', 'content-length': stat.size });
+    return createReadStream(job.outPath).pipe(res);
+  }
+
+  // POST /render -> enqueue, return jobId immediately
+  if (req.method === 'POST' && url === '/render') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > MAX_BODY) { req.destroy(); } });
+    req.on('end', () => {
+      let j; try { j = JSON.parse(body); } catch { return send(res, 400, { error: 'invalid JSON body' }); }
+      if (!j || !j.html) return send(res, 400, { error: 'missing html (POST a self-contained page implementing window.seek/window.__dur)' });
+      const id = randomUUID();
+      const dir = mkdtempSync(join(tmpdir(), 'dhee-render-'));
+      writeFileSync(join(dir, 'page.html'), j.html);
+      if (j.audioB64) writeFileSync(join(dir, 'audio.wav'), Buffer.from(j.audioB64, 'base64'));
+      const job = { id, status: 'queued', dir, outPath: join(dir, 'out.mp4'), size: j.size || [1280, 720], fps: Number(j.fps) || 30, dur: Number(j.dur) || 0, scale: Number(j.scale) || 2, tCreated: Date.now() };
+      jobs.set(id, job); queue.push(job); setImmediate(pump);
+      return send(res, 202, { jobId: id, status: 'queued' });
+    });
+    return;
+  }
+
+  return send(res, 404, { error: 'not found' });
 });
 
-server.listen(PORT, () => process.stderr.write(`dhee-render-server (generic html->video) listening on :${PORT} (workers=${WORKERS})\n`));
+server.listen(PORT, () => process.stderr.write(`dhee-render-server (generic html->video, async) listening on :${PORT} (workers=${WORKERS})\n`));
